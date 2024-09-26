@@ -1,0 +1,323 @@
+---
+title: "ConvergentMCMC_SIR"
+author: "Brian Masafu"
+date: "2024-09-26"
+output:
+  pdf_document: default
+  html_document: default
+---
+# SIR_CompartmentalWith_3_AgeStructuredComparments 
+# libraries
+```{r}
+library(deSolve)
+library(tidyverse)
+library(coda)
+library(MCMCvis)
+library(lattice)
+
+```
+
+
+# SIR model function with age compartments
+```{r}
+SIR_model_age <- function(time, state, parameters) {
+  # Children (age group 1)
+  S1 <- state[1]
+  I1 <- state[2]
+  R1 <- state[3]
+  
+  # Adults (age group 2)
+  S2 <- state[4]
+  I2 <- state[5]
+  R2 <- state[6]
+  
+  # Elderly (age group 3)
+  S3 <- state[7]
+  I3 <- state[8]
+  R3 <- state[9]
+  
+  # Total population for each age group
+  N1 <- S1 + I1 + R1
+  N2 <- S2 + I2 + R2
+  N3 <- S3 + I3 + R3
+  
+  # Transmission rates (force of infection) for each age group
+  beta1 <- parameters["beta1"]
+  beta2 <- parameters["beta2"]
+  beta3 <- parameters["beta3"]
+  gamma <- parameters["gamma"]
+  
+  # Equations for age group 1 (Children)
+  dS1 <- -beta1 * S1 * I1 / N1 
+  dI1 <- beta1 * S1 * I1 / N1 - gamma * I1
+  dR1 <- gamma * I1
+  
+  # Equations for age group 2 (Adults)
+  dS2 <- -beta2 * S2 * I2 / N2
+  dI2 <- beta2 * S2 * I2 / N2 - gamma * I2
+  dR2 <- gamma * I2
+  
+  # Equations for age group 3 (Elderly)
+  dS3 <- -beta3 * S3 * I3 / N3
+  dI3 <- beta3 * S3 * I3 / N3 - gamma * I3
+  dR3 <- gamma * I3
+  
+  # Returning the rates of change for all compartments
+  list(c(dS1, dI1, dR1, dS2, dI2, dR2, dS3, dI3, dR3))
+}
+
+```
+
+# Parameters
+
+```{r}
+beta1 <- 0.4   # Force of infection for children
+beta2 <- 0.3   # Force of infection for adults
+beta3 <- 0.25  # Force of infection for elderly
+gamma <- 0.1 
+```
+
+# Initial conditions for each age group &time sequence
+```{r}
+# Initial conditions for each age group
+initial_state <- c(S1 = 50, I1 = 1, R1 = 0,  # Children
+                   S2 = 40, I2 = 1, R2 = 0,  # Adults
+                   S3 = 30, I3 = 1, R3 = 0)  # Elderly
+
+# Time sequence (one year with daily time steps)
+times <- seq(0, 365, by = 1)
+```
+
+# simulation of the model & plotting of the three states
+```{r}
+# Simulation of the SIR model with age structure
+parameters <- c(beta1 = beta1, beta2 = beta2, beta3 = beta3, gamma = gamma)
+simulated_data <- ode(y = initial_state, times = times, func = SIR_model_age, parms = parameters) %>% data.frame()
+
+# Ensuring that the observed data columns are numeric
+simulated_data[, 2:10] <- lapply(simulated_data[, 2:10], as.numeric)
+
+# Adding a Time column for plotting
+simulated_data$Time <- times
+
+# Reshaping data to long format for plotting
+simulated_data_long <- simulated_data %>%
+  pivot_longer(cols = -Time, names_to = "Compartment", values_to = "Count")
+
+# Plotting all states on one graph with correct color mapping and y-axis limits
+ggplot(simulated_data_long, aes(x = Time, y = Count, color = Compartment)) +
+  geom_line() +
+  labs(title = "SIR Model Simulation with 3_Agecompartments", x = "Time (days)", y = "Count") +
+  scale_color_manual(values = c("blue", "green", "red",      # Children
+                                "blue4", "green4", "red4",  # Adults
+                                "blue2", "green2", "red2",  # Elderly
+                                "black")) +                  # Recovered (R1, R2, R3)
+  coord_cartesian(ylim = c(0, 100)) +  #  y-axis limits from 0 to 100
+  theme_minimal()
+
+```
+SIR_plots showing different levels of force of infections and recovery rates among the 3 age structured population with (Susceptible, Infected and Recovered States)
+
+# Log-likelihood function for the model with age compartments
+```{r}
+log_likelihood_age <- function(params, observed_data, initial_state, times) {
+  
+  # Parameters with the current estimate of beta for each age group
+  parameters <- c(params["beta1"], params["beta2"], params["beta3"], gamma = 1/10)
+  
+  # Simulating the model
+  out <- ode(y = initial_state, times = times, func = SIR_model_age, parms = parameters)
+  model_data <- as.data.frame(out)
+  
+  #checking observed data(numeric form)
+  observed_data[, 2:10] <- lapply(observed_data[, 2:10], as.numeric)
+  
+  # Log-likelihood for each compartment in each age group
+  log_likelihood <- 0
+  for (col in 2:10) {
+    obs <- ceiling(observed_data[[col]])
+    model <- model_data[[col]]
+    log_likelihood <- log_likelihood + sum(dpois(obs, lambda = model, log = TRUE))
+  }
+  
+  return(log_likelihood)
+}
+```
+
+# MCMC settings
+```{r}
+
+n_iter <- 5000
+beta_init <- c(0.1, 0.15, 0.2)  # Initial beta values for MCMC
+n_chains <- 3
+sd_prop <- rep(0.001, n_chains)  # Initial SD for each chain
+target_accept_rate <- 0.234  # Target acceptance rate for adaptive MCMC
+adapt_rate <- 0.01  # Rate of adaptation for the proposal SD
+```
+
+# Incorporating RHAT logic: storage for multiple chains& initializing the chain
+```{r}
+# Incorporating RHAT logic: storage for multiple chains
+beta_chains <- matrix(NA, ncol = n_chains, nrow = n_iter)
+
+# Initializing chains with different initial values
+beta_chains[1, ] <- beta_init
+
+# Prior distribution: Beta(2, 2)
+prior <- function(beta) {
+  return(dbeta(beta, 2, 2, log = TRUE))
+}
+```
+Rhat(potential scale reduction factor) - Measures whether or not an MCMC algorithm converged. It checks the distribution of a chain (after warm up ) the same as the distribution of the second half of the chain.
+2. If the algorithm starts at 2 different places and chain left to warm up, both the chains have the same distribution.
+
+
+# MCMC loop for each chain
+```{r}
+
+# MCMC loop for each chain
+for (chain in 1:n_chains) {
+  
+  acceptance_counter <- 0 # Reset acceptance counter for each chain
+  
+  # Initializing log likelihood for current chain
+  loglik_curr <- log_likelihood_age(params = c(beta1 = beta_chains[1, chain], beta2 = beta_chains[1, chain], beta3 = beta_chains[1, chain]),
+                                    observed_data = simulated_data,
+                                    initial_state = initial_state,
+                                    times = times) +
+    prior(beta_chains[1, chain])
+  
+  for (i in 2:n_iter) {
+    # Proposing new beta from a normal distribution centered around the current value
+    beta_proposed <- rnorm(1, mean = beta_chains[i - 1, chain], sd = sd_prop[chain])
+    
+    if (beta_proposed > 0) {  # Ensure beta is positive
+      loglik_prop <- log_likelihood_age(params = c(beta1 = beta_proposed, beta2 = beta_proposed, beta3 = beta_proposed),
+                                        observed_data = simulated_data,
+                                        initial_state = initial_state,
+                                        times = times) + 
+        prior(beta_proposed)
+    } else {
+      loglik_prop <- -1E6  # Penalize invalid proposals
+    }
+    
+    # Calculating acceptance probability
+    acceptance_prob <- loglik_prop - loglik_curr
+    
+    # Metropolis-Hastings acceptance step
+    if (log(runif(1)) < acceptance_prob) {
+      beta_chains[i, chain] <- beta_proposed
+      loglik_curr <- loglik_prop
+      acceptance_counter <- acceptance_counter + 1
+    } else {
+      beta_chains[i, chain] <- beta_chains[i - 1, chain]
+    }
+    
+    # Adaptive adjustment of proposal standard deviation (sd_prop)
+    if (i > 100) {  # Adapt every 100 iterations
+      acceptance_rate <- acceptance_counter / i
+      sd_prop[chain] <- sd_prop[chain] * exp(adapt_rate * (acceptance_rate - target_accept_rate))
+    }
+  }
+}
+
+```
+
+#Assigning parameter names and converting the chains into compartible data
+```{r}
+# Assigning parameter names to the columns in beta_chains
+colnames(beta_chains) <- rep("Beta", n_chains)
+
+#  mcmc.list 
+burnin <- 1000
+mcmc_out <- mcmc.list(
+  as.mcmc(beta_chains[burnin:n_iter, 1, drop = FALSE]),
+  as.mcmc(beta_chains[burnin:n_iter, 2, drop = FALSE]),
+  as.mcmc(beta_chains[burnin:n_iter, 3, drop = FALSE])
+)
+
+# Converting beta_chains matrix into mcmc objects 
+mcmc_chain1 <- as.mcmc(beta_chains[, 1])
+mcmc_chain2 <- as.mcmc(beta_chains[, 2])
+mcmc_chain3 <- as.mcmc(beta_chains[, 3])
+
+# Combining all chains into an mcmc.list object
+mcmc_combined <- mcmc.list(mcmc_chain1, mcmc_chain2, mcmc_chain3)
+
+# Calculating R-hat using rs tan's summary function
+rhat_values <- rstan::Rhat(as.matrix(mcmc_combined))
+
+
+```
+
+# Printing R-hat values for convergence diagnostics
+
+```{r}
+# Printing R-hat values for convergence diagnostics
+print(rhat_values)
+
+```
+Rhat values close to 1(1.1) indicates that the chain has converged. Values greater than 1.1 suggests that the chain has not yet converged and you may need to run more iteration. `Rhat calculations` You need multiple chains to calculate Rhat.
+#plots for trace mcmc
+```{r}
+
+#  trace plot using coda's plot function
+plot(mcmc_combined, trace = TRUE, density = FALSE, main = "Trace Plots for MCMC Chains")
+
+# Assigning column names to the beta_chains matrix 
+colnames(beta_chains) <- c("Beta1", "Beta2", "Beta3")
+
+# Converting each chain to mcmc objects again
+mcmc_chain1 <- as.mcmc(matrix(beta_chains[, "Beta1"], ncol = 1, dimnames = list(NULL, "Beta")))
+mcmc_chain2 <- as.mcmc(matrix(beta_chains[, "Beta2"], ncol = 1, dimnames = list(NULL, "Beta")))
+mcmc_chain3 <- as.mcmc(matrix(beta_chains[, "Beta3"], ncol = 1, dimnames = list(NULL, "Beta")))
+
+# Combining  into an mcmc.list object
+mcmc_combined <- mcmc.list(mcmc_chain1, mcmc_chain2, mcmc_chain3)
+
+# MCMCtrace 
+MCMCtrace(mcmc_combined, params = "Beta", pdf = FALSE)
+
+# Ploting posterior density using coda's densityplot function
+densityplot(mcmc_combined, main = "Posterior Density of Beta")
+
+
+# posterior  visualization using MCMCvis
+MCMCplot(mcmc_combined, params = "Beta", main = "Posterior Distribution of Beta")
+
+```
+
+# Calculate Gelman and Rubin's diagnostic (R-hat)
+```{r}
+gelman.diag(mcmc_combined)
+```
+This MCMC chains have likely converged to the same target distribution, and there is little difference between the chains' behavior.Values close to 1 (typically less than 1.1) are considered evidence of convergence.
+
+# MCMCvis to summary of chains including R-hat and effective sample size
+```{r}
+
+MCMCsummary(mcmc_combined, Rhat = TRUE, n.eff = TRUE)
+```
+
+# rstan for comprehensive summary including n_eff and other statistics
+```{r}
+
+rstan::summary(mcmc_combined)
+```
+
+# MCMC Trace for Beta && # Histogram of posterior distribution
+```{r}
+# MCMC Trace for Beta
+mcmc_df <- data.frame(Iteration = burnin:n_iter, Beta = c(beta_chains[burnin:n_iter, ]))
+ggplot(mcmc_df, aes(x = Iteration, y = Beta)) +
+  geom_line(color = "blue", linewidth = 1) +
+  labs(title = "MCMC Trace for Beta (Adaptive MCMC)", x = "Iteration", y = "Beta") +
+  theme_minimal()
+
+# Histogram of posterior distribution
+ggplot(data.frame(Beta = c(beta_chains[burnin:n_iter, ])), aes(x = Beta)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  labs(title = "Posterior Distribution of Beta", x = "Beta", y = "Frequency") +
+  theme_minimal()
+
+```
